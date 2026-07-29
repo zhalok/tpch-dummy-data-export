@@ -1,0 +1,1 @@
+A simple python script that will export the dummy data from https://relational.fel.cvut.cz/dataset/TPCH
