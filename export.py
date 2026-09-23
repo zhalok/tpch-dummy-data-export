@@ -3,6 +3,7 @@ import os
 import pymysql
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 OUTPUT_DIR = "tables"
 
@@ -108,6 +109,44 @@ def _create_postgres_database_if_missing():
     cursor.close()
     conn.close()
 
+PAGE_SIZE = 5000
+POOL_MIN_CONNECTIONS = 1
+POOL_MAX_CONNECTIONS = 5
+
+
+def _create_postgres_table(pool, table, columns):
+    column_defs = ", ".join(
+        f'"{name}" {_postgres_type_for(col_type)}' for name, col_type in columns
+    )
+
+    pg_conn = pool.getconn()
+    try:
+        pg_cursor = pg_conn.cursor()
+        pg_cursor.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE;')
+        pg_cursor.execute(f'CREATE TABLE "{table}" ({column_defs});')
+        pg_conn.commit()
+        pg_cursor.close()
+    finally:
+        pool.putconn(pg_conn)
+
+
+def _insert_postgres_page(pool, table, column_names, rows):
+    insert_columns = ", ".join(f'"{name}"' for name in column_names)
+
+    pg_conn = pool.getconn()
+    try:
+        pg_cursor = pg_conn.cursor()
+        psycopg2.extras.execute_values(
+            pg_cursor,
+            f'INSERT INTO "{table}" ({insert_columns}) VALUES %s',
+            rows,
+        )
+        pg_conn.commit()
+        pg_cursor.close()
+    finally:
+        pool.putconn(pg_conn)
+
+
 def export_tpch_to_postgres():
     _create_postgres_database_if_missing()
 
@@ -115,44 +154,48 @@ def export_tpch_to_postgres():
     mysql_conn = pymysql.connect(**CONFIG)
     mysql_cursor = mysql_conn.cursor()
 
-    print("Connecting to Postgres...")
-    pg_conn = psycopg2.connect(**POSTGRES_CONFIG)
-    pg_cursor = pg_conn.cursor()
+    print("Creating Postgres connection pool...")
+    pool = psycopg2.pool.SimpleConnectionPool(
+        POOL_MIN_CONNECTIONS, POOL_MAX_CONNECTIONS, **POSTGRES_CONFIG
+    )
 
-    mysql_cursor.execute("SHOW TABLES;")
-    tables = [row[0] for row in mysql_cursor.fetchall()]
+    try:
+        mysql_cursor.execute("SHOW TABLES;")
+        tables = [row[0] for row in mysql_cursor.fetchall()]
 
-    print(f"Found {len(tables)} tables: {', '.join(tables)}\n")
+        print(f"Found {len(tables)} tables: {', '.join(tables)}\n")
 
-    for table in tables:
-        print(f"Exporting table: {table}...")
+        for table in tables:
+            print(f"Exporting table: {table}...")
 
-        mysql_cursor.execute(f"DESCRIBE `{table}`;")
-        columns = [(row[0], row[1]) for row in mysql_cursor.fetchall()]
-        column_names = [name for name, _ in columns]
+            mysql_cursor.execute(f"DESCRIBE `{table}`;")
+            columns = [(row[0], row[1]) for row in mysql_cursor.fetchall()]
+            column_names = [name for name, _ in columns]
 
-        column_defs = ", ".join(
-            f'"{name}" {_postgres_type_for(col_type)}' for name, col_type in columns
-        )
-        pg_cursor.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE;')
-        pg_cursor.execute(f'CREATE TABLE "{table}" ({column_defs});')
+            _create_postgres_table(pool, table, columns)
 
-        mysql_cursor.execute(f"SELECT * FROM `{table}`;")
-        rows = mysql_cursor.fetchall()
+            # Server-side cursor: rows stream from MySQL as we fetch them
+            # instead of the whole table being buffered client-side up front.
+            stream_cursor = mysql_conn.cursor(pymysql.cursors.SSCursor)
+            stream_cursor.execute(f"SELECT * FROM `{table}`;")
 
-        if rows:
-            insert_columns = ", ".join(f'"{name}"' for name in column_names)
-            psycopg2.extras.execute_values(
-                pg_cursor,
-                f'INSERT INTO "{table}" ({insert_columns}) VALUES %s',
-                rows,
-            )
+            total_rows = 0
+            page_number = 1
+            while True:
+                page = stream_cursor.fetchmany(PAGE_SIZE)
+                if not page:
+                    break
 
-        pg_conn.commit()
-        print(f"  -> Loaded {len(rows)} rows into Postgres table '{table}'")
+                _insert_postgres_page(pool, table, column_names, page)
+                total_rows += len(page)
+                print(f"  -> Page {page_number}: loaded {len(page)} rows (total {total_rows})")
+                page_number += 1
 
-    mysql_cursor.close()
-    mysql_conn.close()
-    pg_cursor.close()
-    pg_conn.close()
+            stream_cursor.close()
+            print(f"  -> Finished loading {total_rows} rows into Postgres table '{table}'")
+    finally:
+        pool.closeall()
+        mysql_cursor.close()
+        mysql_conn.close()
+
     print("\nAll tables exported successfully from MySQL to Postgres!")
