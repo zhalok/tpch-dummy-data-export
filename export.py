@@ -90,7 +90,27 @@ def export_tpch_to_csv():
     conn.close()
     print(f"\nAll tables exported successfully to '{OUTPUT_DIR}/'!")
 
+def _create_postgres_database_if_missing():
+    admin_config = {**POSTGRES_CONFIG, "dbname": "postgres"}
+    target_db = POSTGRES_CONFIG["dbname"]
+
+    conn = psycopg2.connect(**admin_config)
+    conn.autocommit = True
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s;", (target_db,))
+    if cursor.fetchone() is None:
+        print(f"Database '{target_db}' does not exist, creating it...")
+        cursor.execute(f'CREATE DATABASE "{target_db}";')
+    else:
+        print(f"Database '{target_db}' already exists.")
+
+    cursor.close()
+    conn.close()
+
 def export_tpch_to_postgres():
+    _create_postgres_database_if_missing()
+
     print("Connecting to MySQL...")
     mysql_conn = pymysql.connect(**CONFIG)
     mysql_cursor = mysql_conn.cursor()
