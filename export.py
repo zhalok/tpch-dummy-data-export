@@ -136,8 +136,3 @@ def export_tpch_to_postgres():
     pg_cursor.close()
     pg_conn.close()
     print("\nAll tables exported successfully from MySQL to Postgres!")
-
-
-if __name__ == "__main__":
-    # export_tpch_to_csv()
-    export_tpch_to_postgres()
