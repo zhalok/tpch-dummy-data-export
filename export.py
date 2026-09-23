@@ -1,5 +1,6 @@
 import csv
 import os
+import re
 import pymysql
 import psycopg2
 import psycopg2.extras
@@ -115,9 +116,8 @@ POOL_MAX_CONNECTIONS = 5
 
 
 def _create_postgres_table(pool, table, columns):
-    column_defs = ", ".join(
-        f'"{name}" {_postgres_type_for(col_type)}' for name, col_type in columns
-    )
+    """`columns` is a list of (name, postgres_type) pairs, already resolved."""
+    column_defs = ", ".join(f'"{name}" {pg_type}' for name, pg_type in columns)
 
     pg_conn = pool.getconn()
     try:
@@ -169,29 +169,27 @@ def export_tpch_to_postgres():
             print(f"Exporting table: {table}...")
 
             mysql_cursor.execute(f"DESCRIBE `{table}`;")
-            columns = [(row[0], row[1]) for row in mysql_cursor.fetchall()]
+            columns = [(row[0], _postgres_type_for(row[1])) for row in mysql_cursor.fetchall()]
             column_names = [name for name, _ in columns]
 
             _create_postgres_table(pool, table, columns)
 
-            # Server-side cursor: rows stream from MySQL as we fetch them
-            # instead of the whole table being buffered client-side up front.
-            stream_cursor = mysql_conn.cursor(pymysql.cursors.SSCursor)
-            stream_cursor.execute(f"SELECT * FROM `{table}`;")
+            # Buffered read: the remote server enforces max_statement_time,
+            # so we let MySQL finish the query quickly and page through the
+            # already-fetched rows locally for the (slower) Postgres inserts.
+            mysql_cursor.execute(f"SELECT * FROM `{table}`;")
+            rows = mysql_cursor.fetchall()
 
             total_rows = 0
             page_number = 1
-            while True:
-                page = stream_cursor.fetchmany(PAGE_SIZE)
-                if not page:
-                    break
+            for offset in range(0, len(rows), PAGE_SIZE):
+                page = rows[offset:offset + PAGE_SIZE]
 
                 _insert_postgres_page(pool, table, column_names, page)
                 total_rows += len(page)
                 print(f"  -> Page {page_number}: loaded {len(page)} rows (total {total_rows})")
                 page_number += 1
 
-            stream_cursor.close()
             print(f"  -> Finished loading {total_rows} rows into Postgres table '{table}'")
     finally:
         pool.closeall()
@@ -199,3 +197,162 @@ def export_tpch_to_postgres():
         mysql_conn.close()
 
     print("\nAll tables exported successfully from MySQL to Postgres!")
+
+CSV_TYPE_SAMPLE_SIZE = 100
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _infer_postgres_type(values):
+    non_empty = [v for v in values if v != ""]
+    if not non_empty:
+        return "TEXT"
+
+    if all(DATE_PATTERN.match(v) for v in non_empty):
+        return "DATE"
+
+    try:
+        for v in non_empty:
+            int(v)
+        return "BIGINT"
+    except ValueError:
+        pass
+
+    try:
+        for v in non_empty:
+            float(v)
+        return "DOUBLE PRECISION"
+    except ValueError:
+        pass
+
+    return "TEXT"
+
+
+def _infer_csv_columns(filepath):
+    with open(filepath, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        sample_rows = []
+        for row in reader:
+            sample_rows.append(row)
+            if len(sample_rows) >= CSV_TYPE_SAMPLE_SIZE:
+                break
+
+    column_types = [
+        _infer_postgres_type([row[i] for row in sample_rows])
+        for i in range(len(headers))
+    ]
+    return list(zip(headers, column_types))
+
+
+def export_csv_to_postgres():
+    """Load the CSVs produced by `export_tpch_to_csv` into Postgres.
+
+    Reading from MySQL and writing to Postgres are fully decoupled here (no
+    connection to either server is held open across the other's work), which
+    avoids the MySQL `max_statement_time` timeout that a live MySQL->Postgres
+    pipeline can hit while Postgres inserts are in progress.
+    """
+    _create_postgres_database_if_missing()
+
+    csv_files = sorted(f for f in os.listdir(OUTPUT_DIR) if f.endswith(".csv"))
+    if not csv_files:
+        print(f"No CSV files found in '{OUTPUT_DIR}/'. Run export_tpch_to_csv() first.")
+        return
+
+    print("Creating Postgres connection pool...")
+    pool = psycopg2.pool.SimpleConnectionPool(
+        POOL_MIN_CONNECTIONS, POOL_MAX_CONNECTIONS, **POSTGRES_CONFIG
+    )
+
+    try:
+        for csv_file in csv_files:
+            table = csv_file[:-len(".csv")]
+            filepath = os.path.join(OUTPUT_DIR, csv_file)
+            print(f"Loading table: {table}...")
+
+            columns = _infer_csv_columns(filepath)
+            column_names = [name for name, _ in columns]
+            _create_postgres_table(pool, table, columns)
+
+            with open(filepath, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                next(reader)  # skip header
+
+                total_rows = 0
+                page_number = 1
+                page = []
+                for row in reader:
+                    page.append([value if value != "" else None for value in row])
+                    if len(page) >= PAGE_SIZE:
+                        _insert_postgres_page(pool, table, column_names, page)
+                        total_rows += len(page)
+                        print(f"  -> Page {page_number}: loaded {len(page)} rows (total {total_rows})")
+                        page_number += 1
+                        page = []
+
+                if page:
+                    _insert_postgres_page(pool, table, column_names, page)
+                    total_rows += len(page)
+                    print(f"  -> Page {page_number}: loaded {len(page)} rows (total {total_rows})")
+
+            print(f"  -> Finished loading {total_rows} rows into Postgres table '{table}'")
+    finally:
+        pool.closeall()
+
+    print("\nAll CSV files loaded successfully into Postgres!")
+
+DUMP_FILE = "pg_dump.sql"
+
+
+def _copy_escape(value):
+    """Escape a value for Postgres COPY text format; "" is treated as NULL."""
+    if value == "":
+        return "\\N"
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
+def export_csv_to_pg_dump(dump_path=DUMP_FILE):
+    """Turn the CSVs produced by `export_tpch_to_csv` into a plain-text
+    Postgres dump (CREATE TABLE + COPY ... FROM stdin blocks), the same
+    shape `pg_dump --format=plain` produces. No database connection is
+    needed at all to generate it; load it later with:
+
+        psql -h localhost -U postgres -d tpch -f pg_dump.sql
+    """
+    csv_files = sorted(f for f in os.listdir(OUTPUT_DIR) if f.endswith(".csv"))
+    if not csv_files:
+        print(f"No CSV files found in '{OUTPUT_DIR}/'. Run export_tpch_to_csv() first.")
+        return
+
+    with open(dump_path, "w", encoding="utf-8") as out:
+        for csv_file in csv_files:
+            table = csv_file[:-len(".csv")]
+            filepath = os.path.join(OUTPUT_DIR, csv_file)
+            print(f"Writing table: {table}...")
+
+            columns = _infer_csv_columns(filepath)
+            column_defs = ", ".join(f'"{name}" {pg_type}' for name, pg_type in columns)
+            column_names = ", ".join(f'"{name}"' for name, _ in columns)
+
+            out.write(f'DROP TABLE IF EXISTS "{table}" CASCADE;\n')
+            out.write(f'CREATE TABLE "{table}" ({column_defs});\n')
+            out.write(f'COPY "{table}" ({column_names}) FROM stdin;\n')
+
+            total_rows = 0
+            with open(filepath, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                next(reader)  # skip header
+                for row in reader:
+                    out.write("\t".join(_copy_escape(value) for value in row) + "\n")
+                    total_rows += 1
+
+            out.write("\\.\n\n")
+            print(f"  -> Wrote {total_rows} rows for table '{table}'")
+
+    print(f"\nDump written to '{dump_path}'. Load it with:")
+    print(f"  psql -h {POSTGRES_CONFIG['host']} -U {POSTGRES_CONFIG['user']} -d {POSTGRES_CONFIG['dbname']} -f {dump_path}")
