@@ -22,7 +22,7 @@ POSTGRES_CONFIG = {
     "port": 5432,
     "user": "postgres",
     "password": "postgres",
-    "dbname": "tpch",
+    "dbname": "postgres",
 }
 
 # Rough MySQL -> Postgres type mapping, keyed by the MySQL type name
